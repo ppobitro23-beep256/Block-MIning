@@ -42,7 +42,7 @@ const depositLimit  = rateLimit(30,  60_000);   // 30/min
 // ══════════════════════════════════════════
 // DEPOSIT CONFIG
 // ══════════════════════════════════════════
-const DEPOSIT_WALLET      = (process.env.DEPOSIT_WALLET || '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148').toLowerCase();
+const DEPOSIT_WALLET      = (process.env.DEPOSIT_WALLET || '0x04c872dc6314ec72d782df45a7ea5b4b5b480bb8').toLowerCase();
 const USDT_CONTRACT       = (process.env.USDT_CONTRACT  || '0x55d398326f99059fF775485246999027B3197955').toLowerCase();
 const BEP20_WALLET        = DEPOSIT_WALLET;
 const BEP20_USDT_CONTRACT = USDT_CONTRACT;
@@ -57,7 +57,7 @@ function httpsGet(url, headers) {
       port:     443,
       path:     opts.pathname + opts.search,
       method:   'GET',
-      headers:  Object.assign({ 'User-Agent': 'BlockUSDT/1.0', 'Accept': 'application/json' }, headers || {}),
+      headers:  Object.assign({ 'User-Agent': 'BlockMinings/1.0', 'Accept': 'application/json' }, headers || {}),
     };
     const req = https.request(options, (res) => {
       let data = '';
@@ -83,7 +83,7 @@ const fs   = require('fs');
 const path = require('path');
 
 // ── Simple File Logger ──────────────────────────────
-const LOG_FILE = path.join('/tmp', 'blockusdt.log');
+const LOG_FILE = path.join('/tmp', 'blockminings.log');
 function log(tag, msg) {
   const line = `[${new Date().toISOString()}] [${tag}] ${msg}\n`;
   console.log(line.trim());
@@ -159,7 +159,7 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 if (!DATABASE_URL) { console.error('❌ DATABASE_URL env var missing'); process.exit(1); }
 if (!ADMIN_SECRET) { console.error('❌ ADMIN_SECRET env var missing'); process.exit(1); }
 if (!BOT_TOKEN)    { console.warn('⚠️ BOT_TOKEN env var missing — Telegram auth verification disabled'); }
-if (!process.env.WEBAPP_URL) { console.warn('⚠️ WEBAPP_URL not set — using default https://myusdtapp.xyz/'); }
+if (!process.env.WEBAPP_URL) { console.warn('⚠️ WEBAPP_URL not set — using default https://block-minings.pages.dev/'); }
 
 // ══════════════════════════════════════════
 // TELEGRAM GROUP PROOF MODULE
@@ -504,7 +504,7 @@ async function setupDB() {
     deposit_min: '5',
     trc20_address: 'TVo9famfMAmvN9DnbtQ2fNLh6DwYJ698cZ',
     erc20_address: '0x4878d34e544b79801249d36303b321ca8e634bdd',
-    bep20_address: '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148',
+    bep20_address: '0x04c872dc6314ec72d782df45a7ea5b4b5b480bb8',
     ref_lvl1_pct: '8', ref_lvl2_pct: '3', ref_lvl3_pct: '1',
     maintenance: '0',
     promo_enabled: '0',
@@ -3874,7 +3874,7 @@ app.post('/admin/tg-group/test', adminAuth, async (req, res) => {
 
     const payload = {
       chat_id:    cfg.chatId,
-      text:       '💸 <b>Block USDT Proof Feed Connected Successfully</b>',
+      text:       '💸 <b>Block Minings Proof Feed Connected Successfully</b>',
       parse_mode: 'HTML'
     };
     if (cfg.topicId) {
@@ -5038,7 +5038,7 @@ async function sendBroadcastNow(broadcastId) {
 
   let sent = 0, failed = 0;
 
-  const WEBAPP_URL = process.env.WEBAPP_URL || 'https://myusdtapp.xyz/';
+  const WEBAPP_URL = process.env.WEBAPP_URL || 'https://block-minings.pages.dev/';
 
   for (const user of users) {
     try {
