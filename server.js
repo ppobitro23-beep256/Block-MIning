@@ -850,49 +850,7 @@ async function setupDB() {
     log('MIGRATION', 'Plans synced OK');
   } catch(e) { log('MIGRATION_ERR', e.message); }
 
-  // ── ONE-TIME MIGRATION: Move old cancel refunds from balance to reinvest_credit ──
-  // Runs safely every startup — skips already-migrated users via cancel_refund_migrated flag
-  try {
-    await db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS cancel_refund_migrated BOOLEAN DEFAULT FALSE`);
-
-    // Find users who have cancel refunds but not yet migrated
-    const toMigrate = await db.all(`
-      SELECT cl.user_id, SUM(cl.refund) as total_refund
-      FROM plan_cancel_logs cl
-      JOIN users u ON u.id = cl.user_id
-      WHERE cl.refund > 0
-        AND u.cancel_refund_migrated = FALSE
-      GROUP BY cl.user_id
-    `);
-
-    for (const row of toMigrate) {
-      const uid        = row.user_id;
-      const toMove     = parseFloat(row.total_refund) || 0;
-      if (toMove <= 0) continue;
-
-      // Atomic: move min(refund, balance) from balance to reinvest_credit
-      // Use separate steps to avoid SQL evaluation order ambiguity
-      const userRow = await db.one(`SELECT balance, reinvest_credit FROM users WHERE id=$1`, [uid]);
-      const actualMove = Math.min(toMove, parseFloat(userRow.balance || 0));
-      if (actualMove > 0) {
-        await pool.query(
-          `UPDATE users SET balance=balance-$1, reinvest_credit=reinvest_credit+$1, cancel_refund_migrated=TRUE WHERE id=$2`,
-          [+actualMove.toFixed(4), uid]
-        );
-      } else {
-        // No balance to move but still mark migrated
-        await pool.query(`UPDATE users SET cancel_refund_migrated=TRUE WHERE id=$1`, [uid]);
-      }
-
-      log('MIGRATION', `User ${uid}: moved up to $${toMove} to reinvest_credit`);
-    }
-
-    if (toMigrate.length > 0) {
-      log('MIGRATION', `Cancel refund migration complete — ${toMigrate.length} user(s) migrated`);
-    }
-  } catch(migErr) {
-    log('MIGRATION_ERR', 'Cancel refund migration failed (non-critical): ' + migErr.message);
-  }
+  // cancel_refund migration removed — reinvest_credit deprecated
 }
 
 // Handle unhandled promise rejections
@@ -1404,6 +1362,13 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
     }
     if (user.is_banned) return res.status(403).json({ error: 'banned', reason: user.ban_reason || '' });
 
+    // ── 4b. Auto-reset today_earned if new UTC day ──
+    const _todayUTC = new Date().toISOString().slice(0, 10);
+    if (user.last_earn_date !== _todayUTC && parseFloat(user.today_earned || 0) > 0) {
+      await db.run(`UPDATE users SET today_earned=0, last_earn_date=$1 WHERE id=$2`, [_todayUTC, uid]);
+      user.today_earned = 0;
+    }
+
     // ── 5. Parallel data fetch with timeout protection ──
     const withTimeout = (promise, ms, fallback) =>
       Promise.race([promise, new Promise(resolve => setTimeout(() => resolve(fallback), ms))]);
@@ -1482,7 +1447,7 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
         is_banned: user.is_banned || 0,
         withdraw_address: user.withdraw_address || null,
         address_locked: !!user.address_locked,
-        reinvest_credit: parseFloat(user.reinvest_credit || 0),
+        reinvest_credit: 0, // deprecated — all earnings go to balance
       },
       investments,
       transactions,
@@ -1641,10 +1606,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
     if (!plan) return res.status(404).json({error:'Plan not found'});
     if (amount < plan.min_amt) return res.status(400).json({error:`Min $${plan.min_amt}`});
     if (amount > plan.max_amt) return res.status(400).json({error:`Max $${plan.max_amt}`});
-    // Allow reinvest_credit to supplement balance for plan purchase
-    const credit = parseFloat(user.reinvest_credit || 0);
-    const totalAvailable = user.balance + credit;
-    if (totalAvailable < amount) return res.status(400).json({error:'Insufficient balance'});
+    if (user.balance < amount) return res.status(400).json({error:'Insufficient balance'});
     // Multiple plans allowed — same plan can be purchased multiple times
 
     // [PLAN UNLOCK] Priority: manual_unlock → promo_unlock → paid_unlock → referrals
@@ -1681,7 +1643,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
       }
     }
 
-    // Check daily limit
+    // Check daily limit — atomic to prevent race condition oversell
     if (plan.daily_limit > 0) {
       const resetHours = parseFloat(plan.reset_hours || 24);
       const lastReset  = plan.last_reset ? new Date(plan.last_reset) : null;
@@ -1692,38 +1654,29 @@ app.post('/api/invest', userAuth, async (req, res) => {
         await db.run(`UPDATE plans SET today_count=0, last_reset=NOW() WHERE id=$1`, [plan_id]);
         plan.today_count = 0;
       }
-      const remaining = plan.daily_limit - (plan.today_count || 0);
-      if (remaining <= 0) {
+      // [ATOMIC SLOT CHECK] — prevents race condition where 2 requests both see remaining>0
+      const slotResult = await pool.query(
+        `UPDATE plans SET today_count=today_count+1
+         WHERE id=$1 AND today_count < daily_limit RETURNING today_count`,
+        [plan_id]
+      );
+      if (slotResult.rowCount === 0) {
         const nextReset = lastReset ? new Date(lastReset.getTime() + resetHours * 60 * 60 * 1000) : null;
         const hoursLeft = nextReset ? Math.ceil((nextReset - now) / (1000 * 60 * 60)) : resetHours;
         return res.status(400).json({error:`Limit reached! Resets in ${hoursLeft}h.`, limitReached: true, hoursLeft});
       }
+      // Slot claimed — skip the old today_count increment below
+      plan._slotClaimed = true;
     }
 
     const daily = +(amount * plan.daily_pct / 100).toFixed(4);
 
-    // Use reinvest_credit first, then balance
-    const creditToUse   = Math.min(credit, amount);
-    const balanceToUse  = +(amount - creditToUse).toFixed(4);
-
-    // [DB-LEVEL GUARD] Conditional deduct — prevents negative balance under race condition
+    // [DB-LEVEL GUARD] Deduct from balance only — atomic race condition guard
     let deductResult;
-    if (creditToUse > 0 && balanceToUse > 0) {
-      deductResult = await pool.query(
-        `UPDATE users SET balance=balance-$1, reinvest_credit=reinvest_credit-$2
-         WHERE id=$3 AND balance>=$1 AND reinvest_credit>=$2 RETURNING id`,
-        [balanceToUse, creditToUse, u.id]
-      );
-    } else if (creditToUse > 0) {
-      deductResult = await pool.query(
-        `UPDATE users SET reinvest_credit=reinvest_credit-$1
-         WHERE id=$2 AND reinvest_credit>=$1 RETURNING id`,
-        [creditToUse, u.id]
-      );
-    } else {
+    {
       deductResult = await pool.query(
         `UPDATE users SET balance=balance-$1 WHERE id=$2 AND balance>=$1 RETURNING id`,
-        [balanceToUse, u.id]
+        [amount, u.id]
       );
     }
     if (deductResult.rowCount === 0) return res.status(400).json({error:'Insufficient balance'});
@@ -1731,10 +1684,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
       `INSERT INTO investments (user_id,plan_name,amount,daily_pct,daily_earn,days_total) VALUES ($1,$2,$3,$4,$5,$6)`,
       [u.id, ((plan.emoji||'')+' '+plan.name).trim(), amount, plan.daily_pct, daily, plan.duration]
     );
-    // Increment daily count
-    if (plan.daily_limit > 0) {
-      await db.run(`UPDATE plans SET today_count=today_count+1 WHERE id=$1`, [plan_id]);
-    }
+    // Daily count already incremented atomically in slot check above
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`,
       [u.id,'invest',amount,'completed',`Invested in ${plan.name}`]
@@ -1897,15 +1847,6 @@ app.post('/api/withdraw', userAuth, async (req, res) => {
       return res.status(400).json({ error: '⚠️ Withdrawal requires at least 1 active investment plan.' });
     }
 
-    // ✅ CANCEL LOCK CHECK — 12h after plan cancellation
-    if (user.last_cancel_at) {
-      const hoursSince = (Date.now() - new Date(user.last_cancel_at).getTime()) / (1000 * 60 * 60);
-      if (hoursSince < 12) {
-        const hoursLeft = Math.ceil(12 - hoursSince);
-        return res.status(400).json({ error: `⏳ Plan recently cancelled. Withdrawals available after ${hoursLeft} more hour${hoursLeft !== 1 ? 's' : ''}.` });
-      }
-    }
-
     // Block check
     const blockMsg = await checkBlocked(u.id);
     if (blockMsg) return res.status(429).json({error: blockMsg});
@@ -2016,7 +1957,7 @@ app.post('/api/collect-daily', userAuth, async (req, res) => {
       return res.status(400).json({ error: 'Already collected. Please wait 24 hours.', secondsLeft: secsLeft });
     }
     await db.run(
-      `UPDATE users SET reinvest_credit=reinvest_credit+$1, total_earned=total_earned+$1, today_earned=today_earned+$1, last_earn_date=TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') WHERE id=$2`,
+      `UPDATE users SET balance=balance+$1, total_earned=total_earned+$1, today_earned=today_earned+$1, last_earn_date=TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') WHERE id=$2`,
       [earn, u.id]
     );
     await db.run(
@@ -2307,7 +2248,7 @@ app.get('/admin/stats', adminAuth, async (req, res) => {
       db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='withdraw' AND status='pending'`),
       db.one(`SELECT COUNT(*) as c FROM users WHERE is_banned=1`),
       db.one(`SELECT COALESCE(SUM(balance),0) as s FROM users`),
-      db.one(`SELECT COALESCE(SUM(reinvest_credit),0) as s FROM users`),
+      Promise.resolve({s: 0}), // reinvest_credit deprecated
       // [NEW] Today's deposits
       db.one(`SELECT COALESCE(SUM(amount),0) as s, COUNT(*) as c FROM transactions WHERE type='deposit' AND status='approved' AND created_at >= NOW() - INTERVAL '24 hours'`),
       // [NEW] Auto vs semi counts
@@ -2384,7 +2325,7 @@ app.get('/admin/stat/balances', adminAuth, async (req, res) => {
     const limit = Math.min(50, parseInt(req.query.limit) || 20);
     const offset = (page - 1) * limit;
     const [rows, totalRow] = await Promise.all([
-      db.all(`SELECT id, username, first_name, balance, reinvest_credit FROM users ORDER BY balance DESC LIMIT $1 OFFSET $2`, [limit, offset]),
+      db.all(`SELECT id, username, first_name, balance FROM users ORDER BY balance DESC LIMIT $1 OFFSET $2`, [limit, offset]),
       db.one(`SELECT COUNT(*) as c FROM users`)
     ]);
     const total = parseInt(totalRow.c);
@@ -2558,13 +2499,13 @@ app.get('/admin/logs', adminAuth, async (req, res) => {
 
 app.post('/admin/user/balance', adminAuth, async (req, res) => {
   try {
-    const {user_id, type, wallet} = req.body;
+    const {user_id, type} = req.body; // wallet param removed — always uses balance
     const amount = parseFloat(req.body.amount);
     if (!user_id || isNaN(amount) || amount <= 0) return res.status(400).json({error:'Invalid user_id or amount'});
     const change = type==='deduct' ? -Math.abs(amount) : Math.abs(amount);
-    const isCredit = wallet === 'credit';
-    const field    = isCredit ? 'reinvest_credit' : 'balance';
-    const label    = isCredit ? 'Credit' : 'Withdrawable';
+    // Always use balance — reinvest_credit is deprecated
+    const field = 'balance';
+    const label = 'Withdrawable';
 
     if (type === 'deduct') {
       const r = await pool.query(`UPDATE users SET ${field}=${field}+$1 WHERE id=$2 AND ${field}>=$3 RETURNING id`, [change, user_id, Math.abs(amount)]);
@@ -3145,30 +3086,18 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
     if (!amount || !VALID.includes(amount))
       return res.status(400).json({ error: 'Invalid package amount' });
 
-    // Check wallet balance (credit first, then withdrawable)
-    const user = await db.one(`SELECT balance, reinvest_credit FROM users WHERE id=$1`, [u.id]);
-    const bal    = parseFloat(user?.balance || 0);
-    const credit = parseFloat(user?.reinvest_credit || 0);
-    const totalAvailable = bal + credit;
+    // Check and deduct from balance only
+    const user = await db.one(`SELECT balance FROM users WHERE id=$1`, [u.id]);
+    const bal = parseFloat(user?.balance || 0);
 
-    if (totalAvailable < amount)
+    if (bal < amount)
       return res.status(400).json({
         error: 'Insufficient balance.',
         balance: bal,
-        credit: credit,
         required: amount
       });
 
-    // Deduct credit first, then balance
-    const creditToUse  = Math.min(credit, amount);
-    const balanceToUse = +(amount - creditToUse).toFixed(4);
-    if (creditToUse > 0 && balanceToUse > 0) {
-      await db.run(`UPDATE users SET balance=balance-$1, reinvest_credit=reinvest_credit-$2 WHERE id=$3`, [balanceToUse, creditToUse, u.id]);
-    } else if (creditToUse > 0) {
-      await db.run(`UPDATE users SET reinvest_credit=reinvest_credit-$1 WHERE id=$2`, [creditToUse, u.id]);
-    } else {
-      await db.run(`UPDATE users SET balance=balance-$1 WHERE id=$2`, [balanceToUse, u.id]);
-    }
+    await db.run(`UPDATE users SET balance=balance-$1 WHERE id=$2`, [amount, u.id]);
 
     // Calculate tap_reward and daily_blk — LOCKED at purchase time
     const blkPrice    = await getCurrentBlkPrice();
@@ -3186,7 +3115,7 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
       [u.id, amount, dailyBlk, tapReward, blkPrice, purchaseMode]
     );
 
-    const updated = await db.one(`SELECT balance, reinvest_credit FROM users WHERE id=$1`, [u.id]);
+    const updated = await db.one(`SELECT balance FROM users WHERE id=$1`, [u.id]);
     log('BOOST', `User ${u.id} bought $${amount} mining boost`);
 
     // Distribute referral commissions — same logic as normal investment plans
@@ -3239,7 +3168,6 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
       success: true,
       message: `Mining boost activated! $${amount} USDT deducted.`,
       balance: parseFloat(updated.balance || 0),
-      credit:  parseFloat(updated.reinvest_credit || 0),
       amount
     });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
@@ -3983,7 +3911,7 @@ async function generateUniqueAmt(base) {
   // ✅ FIX: expanded from 5 → 99 possible suffix values (0.01–0.99)
   // This dramatically reduces collision chance when many deposits are pending
   for (let i = 0; i < 99; i++) {
-    const dec  = (Math.floor(Math.random() * 5) + 1); // 1–5 cents (0.01–0.05)
+    const dec  = (Math.floor(Math.random() * 99) + 1); // 1–99 cents (0.01–0.99)
     const uAmt = +(parseFloat(base) + dec / 100).toFixed(2);
     const ex   = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
@@ -5509,7 +5437,7 @@ app.post('/api/promo/claim', userAuth, async (req, res) => {
     if (enabled !== '1') return res.status(400).json({ error: 'Not available' });
 
     // 2. Must have bound withdrawal address
-    const user = await db.one(`SELECT withdraw_address, address_locked, last_cancel_at FROM users WHERE id=$1`, [u.id]);
+    const user = await db.one(`SELECT withdraw_address, address_locked FROM users WHERE id=$1`, [u.id]);
     if (!user.withdraw_address || !user.address_locked) {
       return res.status(400).json({ error: 'Bind your withdrawal address first' });
     }
@@ -5520,15 +5448,6 @@ app.post('/api/promo/claim', userAuth, async (req, res) => {
     );
     if (!activePlanCheck) {
       return res.status(400).json({ error: '⚠️ Withdrawal requires at least 1 active investment plan.' });
-    }
-
-    // 2c. Cancel lock check
-    if (user.last_cancel_at) {
-      const hoursSince = (Date.now() - new Date(user.last_cancel_at).getTime()) / (1000 * 60 * 60);
-      if (hoursSince < 12) {
-        const hoursLeft = Math.ceil(12 - hoursSince);
-        return res.status(400).json({ error: `⏳ Plan recently cancelled. Withdrawals available after ${hoursLeft} more hour${hoursLeft !== 1 ? 's' : ''}.` });
-      }
     }
 
     // 3. Check lifetime claims (exclude failed — user can retry)
@@ -5771,92 +5690,6 @@ app.post('/api/invest/paid-unlock', userAuth, async (req, res) => {
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error: ' + e.message }); }
 });
 
-// POST /api/invest/cancel — cancel active plan with refund
-app.post('/api/invest/cancel', userAuth, async (req, res) => {
-  try {
-    const u = req.tgUser;
-    const { investment_id } = req.body;
-    if (!investment_id) return res.status(400).json({ error: 'Missing investment_id' });
-
-    const [user, inv] = await Promise.all([
-      db.one(`SELECT * FROM users WHERE id=$1`, [u.id]),
-      db.one(`SELECT * FROM investments WHERE id=$1 AND user_id=$2`, [investment_id, u.id])
-    ]);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    if (!inv)  return res.status(404).json({ error: 'Investment not found' });
-    if (inv.status !== 'active') return res.status(400).json({ error: 'Investment is not active' });
-
-    // Calculate refund: Remaining = Principal - Already Earned, Refund = 90%
-    const investedC   = parseFloat(inv.amount || 0);
-    const dailyEarnC  = parseFloat(inv.daily_earn || 0);
-    const daysDoneC   = parseInt(inv.days_done)  || 0;
-    const pendingC    = parseFloat(inv.pending_earn || 0);
-    const collectedC  = +(dailyEarnC * daysDoneC).toFixed(4);
-    const earned      = +(collectedC + pendingC).toFixed(4);
-    const remaining   = +Math.max(0, investedC - earned).toFixed(4);
-    const refund      = +(remaining * 0.90).toFixed(4);
-
-    // Cancel plan — refund goes to reinvest_credit (cannot withdraw, only reinvest)
-    await db.run(
-      `UPDATE investments SET status='cancelled', cancelled_at=NOW(), cancel_refund=$1 WHERE id=$2`,
-      [refund, inv.id]
-    );
-    if (refund > 0) {
-      await db.run(`UPDATE users SET reinvest_credit=reinvest_credit+$1 WHERE id=$2`, [refund, u.id]);
-    }
-    // Set last_cancel_at for withdraw restriction (12h lock)
-    await db.run(`UPDATE users SET last_cancel_at=NOW() WHERE id=$1`, [u.id]);
-
-    // Log
-    await db.run(
-      `INSERT INTO plan_cancel_logs (user_id, investment_id, plan_name, amount, earned, refund) VALUES ($1,$2,$3,$4,$5,$6)`,
-      [u.id, inv.id, inv.plan_name, inv.amount, earned, refund]
-    );
-
-    log('PLAN_CANCEL', `User ${u.id} cancelled ${inv.plan_name} — refund $${refund}`);
-    res.json({ success: true, refund, plan_name: inv.plan_name });
-
-  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error: ' + e.message }); }
-});
-
-// GET /api/invest/cancel-preview/:id — preview refund before cancel
-app.get('/api/invest/cancel-preview/:id', userAuth, async (req, res) => {
-  try {
-    const u = req.tgUser;
-    const inv = await db.one(
-      `SELECT * FROM investments WHERE id=$1 AND user_id=$2 AND status='active'`,
-      [req.params.id, u.id]
-    );
-    if (!inv) return res.status(404).json({ error: 'Investment not found' });
-
-    const invested   = parseFloat(inv.amount || 0);
-    const dailyEarn  = parseFloat(inv.daily_earn || 0);
-    const daysTotal  = parseInt(inv.days_total) || 50;
-    const daysDone   = parseInt(inv.days_done)  || 0;
-    const pendingEarn = parseFloat(inv.pending_earn || 0);
-
-    // Total already earned (collected + uncollected)
-    const collected  = +(dailyEarn * daysDone).toFixed(4);
-    const earned     = +(collected + pendingEarn).toFixed(4);
-
-    // Remaining = Principal - Already Earned
-    const remaining  = +Math.max(0, invested - earned).toFixed(4);
-    const refund     = +(remaining * 0.90).toFixed(4);
-
-    res.json({
-      plan_name:   inv.plan_name,
-      amount:      invested,
-      daily_earn:  dailyEarn,
-      days_total:  daysTotal,
-      days_done:   daysDone,
-      invested:    invested,
-      earned:      earned,
-      remaining:   remaining,
-      refund:      refund,
-      refund_pct:  90,
-    });
-  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error: ' + e.message }); }
-});
 
 // POST /admin/plans/toggle-unlock — manual unlock toggle
 app.post('/admin/plans/toggle-unlock', adminAuth, async (req, res) => {
