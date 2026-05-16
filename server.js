@@ -490,7 +490,7 @@ async function setupDB() {
       status     TEXT DEFAULT 'pending',
       tx_hash    TEXT,
       created_at TIMESTAMP DEFAULT NOW(),
-      expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '30 minutes')
+      expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '10 minutes')
     )
   `);
   await db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_dep_txhash ON auto_deposits (tx_hash) WHERE tx_hash IS NOT NULL`);
@@ -3897,10 +3897,9 @@ app.get('/api/referral-stats/:id', async (req, res) => {
 // AUTO DEPOSIT — Generate unique amount
 // ══════════════════════════════════════════
 async function generateUniqueAmt(base) {
-  // ✅ FIX: expanded from 5 → 99 possible suffix values (0.01–0.99)
-  // This dramatically reduces collision chance when many deposits are pending
-  for (let i = 0; i < 99; i++) {
-    const dec  = (Math.floor(Math.random() * 99) + 1); // 1–5 cents (0.01–0.05)
+  // Unique amount range: 0.01–0.05 (5 possible values)
+  for (let i = 0; i < 5; i++) {
+    const dec  = (Math.floor(Math.random() * 5) + 1); // 1–5 cents (0.01–0.05)
     const uAmt = +(parseFloat(base) + dec / 100).toFixed(2);
     const ex   = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
