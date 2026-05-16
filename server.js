@@ -889,12 +889,7 @@ function planTierIndex(planName) {
 // Fixed referral commission rates for ALL users — VIP system removed
 const FIXED_RATES = [12, 5, 3, 1, 1, 1, 1]; // L1-L7
 const FIXED_MAX_LEVELS = 7;
-// computeVipLevel removed — VIP system deprecatednst express  = require('express');
-const cors     = require('cors');
-const crypto   = require('crypto');
-const https    = require('https');
-const { Pool } = require('pg');
-const { ethers } = require('ethers');
+// computeVipLevel removed — VIP system deprecated
 
 // ══════════════════════════════════════════
 // RATE LIMITING (no extra library needed)
