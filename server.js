@@ -4522,6 +4522,29 @@ app.get('/admin/plan-stats', adminAuth, async (req, res) => {
 // ══════════════════════════════════════════
 // GLOBAL ERROR HANDLER
 // ══════════════════════════════════════════
+// POST /api/set-pending-ref — called by Telegram bot when user clicks referral link
+app.post('/api/set-pending-ref', adminAuth, async (req, res) => {
+  try {
+    const { user_id, ref_code } = req.body;
+    if (!user_id || !ref_code) return res.status(400).json({ error: 'Missing fields' });
+    if (!ref_code.startsWith('REF')) return res.status(400).json({ error: 'Invalid ref_code' });
+
+    // Save pending ref — will be picked up on next /api/bootstrap
+    await db.run(
+      `INSERT INTO pending_refs (user_id, ref_code, created_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET ref_code=$2, created_at=NOW()`,
+      [String(user_id), ref_code]
+    );
+    log('REF', `Pending ref saved: user ${user_id} → ${ref_code}`);
+    res.json({ success: true });
+  } catch(e) {
+    log('ERROR', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+
 app.use((err, req, res, next) => {
   // CORS error
   if (err.message === 'CORS not allowed') {
