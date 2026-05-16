@@ -1577,7 +1577,14 @@ app.get('/api/user/:id', async (req, res) => {
       db.run(`UPDATE users SET vip_level=$1, vip_updated_at=NOW() WHERE id=$2`, [vs.vip.name, req.params.id]).catch(()=>{});
     } catch(e) { log('WARN', 'VIP calc skipped: ' + e.message); }
 
-    res.json({user: userWithComm, investments, transactions, tasks, referrals, plans, settings, active_referrals: activeReferrals, vip: vipData});
+    res.json({user: userWithComm, investments, transactions, tasks, referrals, plans, settings, active_referrals: activeReferrals, vip: vipData, ref_deposit_stats: await (async function() {
+      try {
+        const uid = req.params.id;
+        const r10 = await db.one(`SELECT COUNT(DISTINCT i.user_id) as cnt FROM investments i JOIN users u ON u.id=i.user_id WHERE u.referred_by=$1 AND i.amount>=10 AND i.status='active'`, [uid]);
+        const r100 = await db.one(`SELECT COUNT(DISTINCT i.user_id) as cnt FROM investments i JOIN users u ON u.id=i.user_id WHERE u.referred_by=$1 AND i.amount>=100 AND i.status='active'`, [uid]);
+        return { max10: parseInt(r10.cnt)||0, max100: parseInt(r100.cnt)||0 };
+      } catch(e) { return { max10:0, max100:0 }; }
+    })()});
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
 
@@ -1993,6 +2000,56 @@ app.post('/api/task/complete', userAuth, async (req, res) => {
       if (activeCount < required) {
         return res.status(400).json({error:`Need ${required} active referral(s). You have ${activeCount}.`});
       }
+    }
+
+    // ref_deposit_10: invite a friend who deposits >= 10 USDT
+    if (task_key === 'ref_deposit_10') {
+      const row = await db.one(
+        `SELECT COUNT(DISTINCT i.user_id) as cnt FROM investments i
+         JOIN users us ON us.id=i.user_id
+         WHERE us.referred_by=$1 AND i.amount >= 10 AND i.status='active'`,
+        [u.id]
+      );
+      if ((parseInt(row.cnt) || 0) < 1)
+        return res.status(400).json({error:'Need 1 referral with 10+ USDT deposit.'});
+    }
+
+    // ref_deposit_100: invite a friend who deposits >= 100 USDT
+    if (task_key === 'ref_deposit_100') {
+      const row = await db.one(
+        `SELECT COUNT(DISTINCT i.user_id) as cnt FROM investments i
+         JOIN users us ON us.id=i.user_id
+         WHERE us.referred_by=$1 AND i.amount >= 100 AND i.status='active'`,
+        [u.id]
+      );
+      if ((parseInt(row.cnt) || 0) < 1)
+        return res.status(400).json({error:'Need 1 referral with 100+ USDT deposit.'});
+    }
+
+    // team_recharge_500: total team deposit >= 500
+    if (task_key === 'team_recharge_500') {
+      const row = await db.one(
+        `SELECT COALESCE(SUM(i.amount),0) as total FROM investments i
+         JOIN users us ON us.id=i.user_id
+         WHERE us.referred_by=$1 AND i.status='active'`,
+        [u.id]
+      );
+      const total = parseFloat(row.total) || 0;
+      if (total < 500)
+        return res.status(400).json({error:`Team deposit $${total.toFixed(2)} / $500 required.`});
+    }
+
+    // team_recharge_1000: total team deposit >= 1000
+    if (task_key === 'team_recharge_1000') {
+      const row = await db.one(
+        `SELECT COALESCE(SUM(i.amount),0) as total FROM investments i
+         JOIN users us ON us.id=i.user_id
+         WHERE us.referred_by=$1 AND i.status='active'`,
+        [u.id]
+      );
+      const total = parseFloat(row.total) || 0;
+      if (total < 1000)
+        return res.status(400).json({error:`Team deposit $${total.toFixed(2)} / $1000 required.`});
     }
 
     // ✅ ATOMIC: INSERT only if not already completed — race condition safe
