@@ -1472,6 +1472,16 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
   }
 });
 
+// ── Public pre-launch status endpoint ────────────────────
+app.get('/api/prelaunch-status', async (req, res) => {
+  try {
+    const depLock   = await getSetting('deposit_lock')  || '0';
+    const withLock  = await getSetting('withdraw_lock') || '0';
+    const launchDate = await getSetting('launch_date')  || '';
+    res.json({ deposit_lock: depLock, withdraw_lock: withLock, launch_date: launchDate });
+  } catch(e) { res.json({ deposit_lock:'0', withdraw_lock:'0', launch_date:'' }); }
+});
+
 app.get('/api/user/:id', async (req, res) => {
   // IDOR guard: if initData header is present, verify it and ensure user matches
   // Frontend intentionally omits header on this GET to avoid CORS preflight (Telegram WebView quirk)
@@ -1832,6 +1842,9 @@ app.post('/api/withdraw', userAuth, async (req, res) => {
     const u = req.tgUser;
     const { amount } = req.body; // ✅ address comes from DB only — not from user input
     const network = 'BEP20';
+    // PRE-LAUNCH lock check
+    const withLock = await getSetting('withdraw_lock');
+    if (withLock === '1') return res.status(403).json({error:'pre_launch_locked', message:'Withdrawals are locked during pre-launch.'});
 
     const user = await db.one(`SELECT * FROM users WHERE id=$1`, [u.id]);
     if (!user) return res.status(404).json({error:'Not found'});
@@ -3973,6 +3986,9 @@ app.post('/api/deposit/create', depositLimit, userAuth, async (req, res) => {
     const u      = req.tgUser;
     const { amount } = req.body;
     if (!isValidAmount(amount, 50000)) return res.status(400).json({error:'Invalid amount'});
+    // PRE-LAUNCH lock check
+    const depLock = await getSetting('deposit_lock');
+    if (depLock === '1') return res.status(403).json({error:'pre_launch_locked', message:'Deposits are locked during pre-launch.'});
     const userCheck = await db.one(`SELECT is_banned, blocked_until FROM users WHERE id=$1`, [u.id]);
     if (userCheck && userCheck.is_banned) return res.status(403).json({error:'banned'});
     const minDep = parseFloat(await getSetting('deposit_min') || 5);
