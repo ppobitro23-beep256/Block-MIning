@@ -2202,7 +2202,10 @@ app.post('/api/debug-log', globalLimit, async (req, res) => {
     if (errorsStr) log('DEBUG', `[CLIENT-ERRORS] ${errorsStr}`);
 
     // Send to admin Telegram if critical error
-    const isCritical = String(trigger).includes('js_error') || String(trigger).includes('promise_reject');
+    // Skip known fake/probe user IDs (not real Telegram users)
+    const FAKE_IDS = ['123456', '1', '0'];
+    const isFakeUid = FAKE_IDS.includes(String(uid || ''));
+    const isCritical = !isFakeUid && hasFail;
     if (isCritical && process.env.ADMIN_TG_CHAT_ID && process.env.BOT_TOKEN) {
       const msg = `⚠️ <b>Client Error</b>\nUser: ${uid}\nTrigger: ${trigger}\nTotal: ${totalMs}ms\nError: ${errorsStr}\nUA: ${(ua||'').slice(0,80)}`;
       fetch('https://api.telegram.org/bot' + process.env.BOT_TOKEN + '/sendMessage', {
