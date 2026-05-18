@@ -995,6 +995,8 @@ async function getActiveReferralCount(userId) {
 // then scan teamDep using that candidate's maxLevels for consistency.
 // reqMaxLevels: hard cap for commission calc to limit DB queries.
 async function getUserVipStatus(userId, reqMaxLevels) {
+  // ✅ FLAT RATE MODE — all users get same commission rates regardless of plan/VIP level.
+  // Dynamic VIP calculation below is intentionally disabled.
   return { vip: { name:'Member', rates: FIXED_RATES, maxLevels: FIXED_MAX_LEVELS }, activeRefs:0, teamDep:0, progress:null, next_vip:null };
   // ── Check manual override FIRST ──────────────────────────────────────
   const overrideRow = await db.one(
@@ -1855,14 +1857,6 @@ app.post('/api/withdraw', userAuth, async (req, res) => {
       return res.status(400).json({error:'No withdrawal address bound. Please bind your address first.'});
     }
     const address = user.withdraw_address; // use DB address, never trust user input
-
-    // ✅ ACTIVE PLAN CHECK — must have at least 1 active investment
-    const activePlan = await db.one(
-      `SELECT id FROM investments WHERE user_id=$1 AND status='active' LIMIT 1`, [u.id]
-    );
-    if (!activePlan) {
-      return res.status(400).json({ error: '⚠️ Withdrawal requires at least 1 active investment plan.' });
-    }
 
     // Block check
     const blockMsg = await checkBlocked(u.id);
@@ -3152,11 +3146,15 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
     if (!amount || !VALID.includes(amount))
       return res.status(400).json({ error: 'Invalid package amount' });
 
-    // Check wallet balance (credit first, then withdrawable)
+    // [ATOMIC] Deduct balance only if sufficient — prevents negative balance under race condition
     const user = await db.one(`SELECT balance FROM users WHERE id=$1`, [u.id]);
     const bal = parseFloat(user?.balance || 0);
     if (bal < amount) return res.status(400).json({ error: 'Insufficient balance.', balance: bal, required: amount });
-    await db.run(`UPDATE users SET balance=balance-$1 WHERE id=$2`, [amount, u.id]);
+    const boostDeduct = await pool.query(
+      `UPDATE users SET balance=balance-$1 WHERE id=$2 AND balance>=$1 RETURNING id`,
+      [amount, u.id]
+    );
+    if (boostDeduct.rowCount === 0) return res.status(400).json({ error: 'Insufficient balance.' });
 
     // Calculate tap_reward and daily_blk — LOCKED at purchase time
     const blkPrice    = await getCurrentBlkPrice();
@@ -5503,14 +5501,6 @@ app.post('/api/promo/claim', userAuth, async (req, res) => {
       return res.status(400).json({ error: 'Bind your withdrawal address first' });
     }
 
-    // 2b. Active plan check
-    const activePlanCheck = await db.one(
-      `SELECT id FROM investments WHERE user_id=$1 AND status='active' LIMIT 1`, [u.id]
-    );
-    if (!activePlanCheck) {
-      return res.status(400).json({ error: '⚠️ Withdrawal requires at least 1 active investment plan.' });
-    }
-
     // 3. Check lifetime claims (exclude failed — user can retry)
     const lifeRow = await db.one(
       `SELECT COUNT(*) as cnt FROM promo_withdrawals WHERE user_id=$1 AND status != 'failed'`,
@@ -5738,8 +5728,12 @@ app.post('/api/invest/paid-unlock', userAuth, async (req, res) => {
     if (Math.abs(amt - requiredFee) > 0.01) return res.status(400).json({ error: `Unlock fee is $${requiredFee}` });
     if (user.balance < requiredFee) return res.status(400).json({ error: 'Insufficient balance' });
 
-    // Deduct fee and log
-    await db.run(`UPDATE users SET balance=balance-$1 WHERE id=$2`, [requiredFee, u.id]);
+    // [ATOMIC] Deduct fee — prevents race condition negative balance
+    const unlockDeduct = await pool.query(
+      `UPDATE users SET balance=balance-$1 WHERE id=$2 AND balance>=$1 RETURNING id`,
+      [requiredFee, u.id]
+    );
+    if (unlockDeduct.rowCount === 0) return res.status(400).json({ error: 'Insufficient balance' });
     await db.run(
       `INSERT INTO plan_unlock_logs (user_id, plan_id, plan_name, unlock_type, fee_paid) VALUES ($1,$2,$3,'paid',$4)`,
       [u.id, plan.id, plan.name, requiredFee]
