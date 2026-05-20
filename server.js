@@ -1792,17 +1792,19 @@ app.post('/api/invest', userAuth, async (req, res) => {
 
         const comm = +(amount * pct).toFixed(4);
         await db.run(
-          `UPDATE users SET pending_commission=pending_commission+$1, total_commission=total_commission+$1 WHERE id=$2`,
+          `UPDATE users SET pending_commission=pending_commission+$1, total_commission=total_commission+$1 WHERE id=$2::BIGINT`,
           [comm, referrerId]
         );
         await db.run(
-          `INSERT INTO commissions (user_id,from_user_id,level,amount) VALUES ($1,$2,$3,$4)`,
+          `INSERT INTO commissions (user_id,from_user_id,level,amount) VALUES ($1::BIGINT,$2::BIGINT,$3,$4)`,
           [referrerId, u.id, lvl+1, comm]
         );
         log('COMM', `L${lvl+1} ${refVip.name} ${pct*100}% $${comm} → user ${referrerId}`);
         currentId = referrerId;
       }
-    } catch(e) { console.log('Commission error:', e.message); }
+    } catch(e) {
+      log('ERROR', 'Commission distribute error: ' + e.message);
+    }
 
     res.json({success:true, daily_earn:daily});
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
@@ -5685,11 +5687,11 @@ app.post('/admin/backfill-commissions', adminAuth, async (req, res) => {
         const comm = +(inv.amount * pct).toFixed(4);
 
         await db.run(
-          `UPDATE users SET pending_commission=pending_commission+$1, total_commission=total_commission+$1 WHERE id=$2`,
+          `UPDATE users SET pending_commission=pending_commission+$1, total_commission=total_commission+$1 WHERE id=$2::BIGINT`,
           [comm, referrerId]
         );
         await db.run(
-          `INSERT INTO commissions (user_id, from_user_id, level, amount) VALUES ($1,$2,$3,$4)`,
+          `INSERT INTO commissions (user_id, from_user_id, level, amount) VALUES ($1::BIGINT,$2::BIGINT,$3,$4)`,
           [referrerId, inv.user_id, lvl+1, comm]
         );
         totalComm += comm;
