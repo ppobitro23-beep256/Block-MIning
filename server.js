@@ -1765,12 +1765,13 @@ app.post('/api/invest', userAuth, async (req, res) => {
       let currentId = u.id;
       const vipCache = new Map(); // per-invest cache: referrerId → vip object
       for (let lvl = 0; lvl < 7; lvl++) {
-        const row = await db.one(`SELECT referred_by, is_banned FROM users WHERE id=$1`, [currentId]);
+        const row = await db.one(`SELECT referred_by FROM users WHERE id=$1`, [currentId]);
         if (!row || !row.referred_by) break;
         const referrerId = row.referred_by;
 
-        // Referrer must not be banned (already fetched above)
-        if (row.is_banned) { currentId = referrerId; continue; }
+        // Check if REFERRER is banned (not the buyer)
+        const refRow = await db.one(`SELECT is_banned FROM users WHERE id=$1`, [referrerId]);
+        if (!refRow || refRow.is_banned) { currentId = referrerId; continue; }
 
         // Compute referrer VIP — use cache to avoid repeat DB calls
         let refVip;
@@ -5634,6 +5635,82 @@ app.get('/admin/ip-monitor', adminAuth, async (req, res) => {
     return res.json({ groups: lResult, total: lTotal, page, limit, pages: Math.ceil(lTotal/limit), tab });
 
   } catch(e) { log('ERROR', 'ip-monitor: ' + e.message); res.status(500).json({error:'Server error'}); }
+});
+
+
+// ══════════════════════════════════════════
+// ADMIN: Backfill commissions for all existing investments
+// POST /admin/backfill-commissions
+// One-time run — skips already-processed investments
+// ══════════════════════════════════════════
+app.post('/admin/backfill-commissions', adminAuth, async (req, res) => {
+  try {
+    log('ADMIN', 'Commission backfill started');
+
+    // Get all active investments that haven't been commission-processed
+    // We detect "already processed" by checking commissions table for that from_user_id+investment combo
+    // Simpler: just check all investments and skip if from_user_id already has a commission entry
+    const investments = await db.all(
+      `SELECT i.id, i.user_id, i.amount, i.created_at
+       FROM investments i
+       WHERE i.status = 'active'
+       ORDER BY i.created_at ASC`
+    );
+
+    let processed = 0, skipped = 0, totalComm = 0;
+    const RATES      = [12, 5, 3, 1, 1, 1, 1];
+    const MAX_LEVELS = 7;
+
+    for (const inv of investments) {
+      // Check if this investment already has commission records
+      const existing = await db.one(
+        `SELECT COUNT(*) as c FROM commissions WHERE from_user_id=$1 AND created_at >= $2::timestamp - interval '1 minute'`,
+        [inv.user_id, inv.created_at]
+      );
+      if (parseInt(existing.c) > 0) { skipped++; continue; }
+
+      // Walk up referral chain up to 7 levels
+      let currentId = inv.user_id;
+      for (let lvl = 0; lvl < MAX_LEVELS; lvl++) {
+        const row = await db.one(`SELECT referred_by FROM users WHERE id=$1`, [currentId]);
+        if (!row || !row.referred_by) break;
+        const referrerId = row.referred_by;
+
+        // Skip banned referrers
+        const refRow = await db.one(`SELECT is_banned FROM users WHERE id=$1`, [referrerId]);
+        if (!refRow || refRow.is_banned) { currentId = referrerId; continue; }
+
+        const pct  = (RATES[lvl] || 0) / 100;
+        if (pct <= 0) { currentId = referrerId; continue; }
+        const comm = +(inv.amount * pct).toFixed(4);
+
+        await db.run(
+          `UPDATE users SET pending_commission=pending_commission+$1, total_commission=total_commission+$1 WHERE id=$2`,
+          [comm, referrerId]
+        );
+        await db.run(
+          `INSERT INTO commissions (user_id, from_user_id, level, amount) VALUES ($1,$2,$3,$4)`,
+          [referrerId, inv.user_id, lvl+1, comm]
+        );
+        totalComm += comm;
+        log('BACKFILL', `L${lvl+1} $${comm} → user ${referrerId} (from invest #${inv.id})`);
+        currentId = referrerId;
+      }
+      processed++;
+    }
+
+    log('ADMIN', `Commission backfill done: ${processed} investments processed, ${skipped} skipped, total $${totalComm.toFixed(4)} distributed`);
+    res.json({
+      success: true,
+      investments_total: investments.length,
+      processed,
+      skipped,
+      total_commission_distributed: +totalComm.toFixed(4)
+    });
+  } catch(e) {
+    log('ERROR', 'Backfill error: ' + e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // WEBHOOK LOGS — Admin visibility
