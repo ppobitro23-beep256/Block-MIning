@@ -500,7 +500,7 @@ async function setupDB() {
 
   // Default settings
   const defaults = {
-    withdraw_fee_pct: '0', withdraw_min: '2', withdraw_max: '10000',
+    withdraw_fee_pct: '0', withdraw_fee_flat: '0', withdraw_min: '2', withdraw_max: '10000',
     deposit_min: '5',
     trc20_address: 'TVo9famfMAmvN9DnbtQ2fNLh6DwYJ698cZ',
     erc20_address: '0x4878d34e544b79801249d36303b321ca8e634bdd',
@@ -1871,12 +1871,13 @@ app.post('/api/withdraw', userAuth, async (req, res) => {
     if (blockMsg) return res.status(429).json({error: blockMsg});
 
     // Validations
-    const [wMinRow, wMaxRow, wFeeRow] = await Promise.all([
-      getSetting('withdraw_min'), getSetting('withdraw_max'), getSetting('withdraw_fee_pct')
+    const [wMinRow, wMaxRow, wFeeRow, wFeeFlatRow] = await Promise.all([
+      getSetting('withdraw_min'), getSetting('withdraw_max'), getSetting('withdraw_fee_pct'), getSetting('withdraw_fee_flat')
     ]);
-    const minW   = parseFloat(wMinRow   || 2);
-    const maxW   = parseFloat(wMaxRow   || 10000);
-    const feePct = parseFloat(wFeeRow   || 0);
+    const minW    = parseFloat(wMinRow      || 2);
+    const maxW    = parseFloat(wMaxRow      || 10000);
+    const feePct  = parseFloat(wFeeRow      || 0);
+    const feeFlat = parseFloat(wFeeFlatRow  || 0);
     const amt    = parseFloat(amount);
 
     if (!amt || amt < minW) {
@@ -1917,7 +1918,7 @@ app.post('/api/withdraw', userAuth, async (req, res) => {
       return res.status(400).json({error:'Daily withdrawal limit reached (max 2 per day). Try again tomorrow.'});
     }
 
-    const fee = +(amt * feePct / 100).toFixed(2);
+    const fee = +(amt * feePct / 100 + feeFlat).toFixed(2);
     // [DB-LEVEL GUARD] Conditional deduct — prevents negative balance under race condition
     const deductResult = await pool.query(
       `UPDATE users SET balance=balance-$1 WHERE id=$2 AND balance>=$1 RETURNING id`,
