@@ -1415,6 +1415,14 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
       });
     });
 
+    // Auto-reset today_earned if it's a new UTC day
+    const _todayUTC = new Date().toISOString().slice(0, 10);
+    if (user.last_earn_date !== _todayUTC && parseFloat(user.today_earned || 0) > 0) {
+      await db.run(`UPDATE users SET today_earned=0, last_earn_date=$1 WHERE id=$2`, [_todayUTC, uid]);
+      user.today_earned = 0;
+      user.last_earn_date = _todayUTC;
+    }
+
     // Referral commission
     const pendingComm = parseFloat(user.pending_commission || 0);
 
@@ -1694,7 +1702,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
     }
     if (deductResult.rowCount === 0) return res.status(400).json({error:'Insufficient balance'});
     await db.run(
-      `INSERT INTO investments (user_id,plan_name,amount,daily_pct,daily_earn,days_total) VALUES ($1,$2,$3,$4,$5,$6)`,
+      `INSERT INTO investments (user_id,plan_name,amount,daily_pct,daily_earn,days_total,last_collect) VALUES ($1,$2,$3,$4,$5,$6,NOW())`,
       [u.id, ((plan.emoji||'')+' '+plan.name).trim(), amount, plan.daily_pct, daily, plan.duration]
     );
     // Increment daily count
@@ -1950,6 +1958,7 @@ app.post('/api/collect-daily', userAuth, async (req, res) => {
     }
 
     const earn = parseFloat(inv.daily_earn);
+    if (!earn || earn <= 0) return res.status(400).json({error: 'Invalid investment earn value'});
     // [ATOMIC RACE GUARD] Single atomic UPDATE that checks 24h window simultaneously
     // This prevents double-collect: if two requests race, only one will pass the WHERE clause
     const collectResult = await pool.query(
@@ -2518,6 +2527,7 @@ app.post('/admin/user/ban', adminAuth, async (req, res) => {
   try {
     const {user_id, reason} = req.body;
     await db.run(`UPDATE users SET is_banned=1, ban_reason=$1 WHERE id=$2`, [reason||'Violated terms', user_id]);
+    log('ADMIN', `User ${user_id} BANNED — reason: ${reason||'Violated terms'}`);
     res.json({success:true});
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
@@ -3183,7 +3193,7 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
       const buyer = await db.one(`SELECT referred_by, is_active_ref, is_banned FROM users WHERE id=$1`, [u.id]);
 
       // Mark as active referral on first mining plan purchase (same as investment)
-      if (!buyer.is_active_ref && buyer.referred_by && buyer.id !== buyer.referred_by) {
+      if (!buyer.is_active_ref && buyer.referred_by && u.id !== buyer.referred_by) {
         await db.run(`UPDATE users SET is_active_ref=TRUE WHERE id=$1`, [u.id]);
         log('REF', `User ${u.id} marked as active referral (mining boost) of ${buyer.referred_by}`);
       }
