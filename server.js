@@ -808,6 +808,20 @@ async function setupDB() {
   await db.run(`CREATE INDEX IF NOT EXISTS idx_webhook_logs_user ON webhook_logs (user_id)`);
   await db.run(`CREATE INDEX IF NOT EXISTS idx_webhook_logs_time ON webhook_logs (created_at DESC)`);
 
+  // IP tracking table
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS user_ips (
+      id         SERIAL PRIMARY KEY,
+      user_id    BIGINT NOT NULL,
+      ip         TEXT NOT NULL,
+      first_seen TIMESTAMP DEFAULT NOW(),
+      last_seen  TIMESTAMP DEFAULT NOW(),
+      UNIQUE(user_id, ip)
+    )
+  `);
+  await db.run(`CREATE INDEX IF NOT EXISTS idx_user_ips_user ON user_ips (user_id)`);
+  await db.run(`CREATE INDEX IF NOT EXISTS idx_user_ips_ip   ON user_ips (ip)`);
+
   // Mark all pre-existing approved withdrawals as 'skipped' in proof logs
   // so fallback scanner never re-posts old withdrawals after deploy
   await db.run(`
@@ -1116,6 +1130,17 @@ function getPlanReferralReq(planName) {
 }
 
 // ── Input validators ─────────────────────────────
+// ── IP Tracking helper ──────────────────────
+async function recordUserIP(userId, ip) {
+  if (!userId || !ip || ip === "unknown" || ip === "::1" || ip === "127.0.0.1") return;
+  try {
+    await db.run(
+      `INSERT INTO user_ips (user_id, ip, first_seen, last_seen) VALUES ($1, $2, NOW(), NOW()) ON CONFLICT (user_id, ip) DO UPDATE SET last_seen=NOW()`,
+      [userId, ip]
+    );
+  } catch(e) { /* non-critical */ }
+}
+
 function isValidAmount(v, max = 100000) {
   const n = parseFloat(v);
   return !isNaN(n) && n > 0 && n <= max && isFinite(n);
@@ -1296,6 +1321,10 @@ app.post('/api/auth', authLimit, async (req, res) => {
     }
     if (user && user.is_banned) return res.status(403).json({error:'banned', reason: user.ban_reason||''});
 
+    // Record IP for multi-account detection
+    const _authIp = (req.headers['x-forwarded-for']||'').split(',')[0].trim() || req.ip || 'unknown';
+    recordUserIP(uid, _authIp);
+
     res.json({success: true});
   } catch(e) {
     log('ERROR', 'Auth error: ' + e.message);
@@ -1473,6 +1502,10 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
       settings,
       vip: vipData,
     });
+    // Record IP for multi-account detection
+    const _bsIp = (req.headers['x-forwarded-for']||'').split(',')[0].trim() || req.ip || 'unknown';
+    recordUserIP(uid, _bsIp);
+
     clearTimeout(_bootstrapTimeout);
 
   } catch(e) {
@@ -5455,6 +5488,135 @@ app.get('/admin/special/logs', adminAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════
+
+// ══════════════════════════════════════════
+// IP MONITOR — Admin endpoints
+// ══════════════════════════════════════════
+
+// GET /admin/ip-monitor/stats — summary counts
+app.get('/admin/ip-monitor/stats', adminAuth, async (req, res) => {
+  try {
+    const [totalRow, suspRow, multiRow] = await Promise.all([
+      db.one(`SELECT COUNT(DISTINCT ip) as c FROM user_ips`),
+      db.one(`SELECT COUNT(*) as c FROM (SELECT ip FROM user_ips GROUP BY ip HAVING COUNT(DISTINCT user_id) >= 3) s`),
+      db.one(`SELECT COUNT(*) as c FROM (SELECT ip FROM user_ips GROUP BY ip HAVING COUNT(DISTINCT user_id) >= 2) s`),
+    ]);
+    res.json({
+      total_ips:  parseInt(totalRow.c) || 0,
+      suspicious: parseInt(suspRow.c)  || 0,
+      multi_ips:  parseInt(multiRow.c) || 0,
+    });
+  } catch(e) { log('ERROR', 'ip-monitor stats: ' + e.message); res.status(500).json({error:'Server error'}); }
+});
+
+// GET /admin/ip-monitor — grouped IP data
+app.get('/admin/ip-monitor', adminAuth, async (req, res) => {
+  try {
+    const search      = (req.query.search || '').trim();
+    const minAccounts = Math.max(1, parseInt(req.query.min_accounts) || 3);
+    const page        = Math.max(1, parseInt(req.query.page) || 1);
+    const limit       = Math.min(50, parseInt(req.query.limit) || 15);
+    const offset      = (page - 1) * limit;
+
+    let ipFilter = null; // array of IPs if search by user
+
+    if (search) {
+      // Detect if searching by IP pattern vs user
+      const isIpLike = /^[0-9.:]+/.test(search);
+      if (isIpLike) {
+        // IP search — handled via ILIKE in main query
+      } else {
+        // User search — find IPs used by matching users
+        const userRows = await db.all(
+          `SELECT DISTINCT ui.ip FROM user_ips ui
+           JOIN users u ON u.id = ui.user_id
+           WHERE CAST(u.id AS TEXT) = $1 OR u.username ILIKE $2 OR u.first_name ILIKE $2
+           LIMIT 100`,
+          [search, `%${search}%`]
+        );
+        ipFilter = userRows.map(r => r.ip);
+        if (!ipFilter.length) return res.json({ groups: [], total: 0, page, limit, pages: 0 });
+      }
+    }
+
+    // Build where clause
+    let whereClause = `HAVING COUNT(DISTINCT user_id) >= ${minAccounts}`;
+    let countParams = [];
+    let mainParams  = [];
+
+    if (ipFilter) {
+      // User-based search: show all IPs of matched users regardless of min_accounts
+      whereClause = `HAVING ip = ANY($1::text[])`;
+      countParams = [ipFilter];
+      mainParams  = [ipFilter, limit, offset];
+    } else if (search) {
+      // IP pattern search
+      whereClause = `HAVING ip ILIKE $1 AND COUNT(DISTINCT user_id) >= ${minAccounts}`;
+      countParams = [`%${search}%`];
+      mainParams  = [`%${search}%`, limit, offset];
+    } else {
+      mainParams  = [limit, offset];
+    }
+
+    const baseQ = ipFilter
+      ? `SELECT ip, COUNT(DISTINCT user_id) as cnt FROM user_ips WHERE ip = ANY($1::text[]) GROUP BY ip`
+      : search
+      ? `SELECT ip, COUNT(DISTINCT user_id) as cnt FROM user_ips WHERE ip ILIKE $1 GROUP BY ip HAVING COUNT(DISTINCT user_id) >= ${minAccounts}`
+      : `SELECT ip, COUNT(DISTINCT user_id) as cnt FROM user_ips GROUP BY ip HAVING COUNT(DISTINCT user_id) >= ${minAccounts}`;
+
+    const countRow = await db.one(`SELECT COUNT(*) as c FROM (${baseQ}) sub`, countParams);
+    const total    = parseInt(countRow.c) || 0;
+
+    // Always parameterize LIMIT/OFFSET — consistent for all 3 cases
+    const ipRows = await db.all(
+      `${baseQ} ORDER BY cnt DESC LIMIT $${countParams.length+1} OFFSET $${countParams.length+2}`,
+      [...countParams, limit, offset]
+    );
+    const ipList = ipRows.map(r => r.ip);
+
+    if (!ipList.length) return res.json({ groups: [], total, page, limit, pages: Math.ceil(total/limit) });
+
+    // Fetch full IP group data
+    const groups = await db.all(
+      `SELECT ip, COUNT(DISTINCT user_id) as account_count, MIN(first_seen) as first_seen, MAX(last_seen) as last_seen
+       FROM user_ips WHERE ip = ANY($1::text[]) GROUP BY ip ORDER BY account_count DESC`,
+      [ipList]
+    );
+
+    // Fetch all users for these IPs in one query
+    const userRows2 = await db.all(
+      `SELECT ui.ip, u.id, u.first_name, u.username, u.uid, u.created_at as registered_at,
+              u.is_banned, ui.first_seen as ip_first_seen, ui.last_seen as ip_last_seen,
+              (SELECT COUNT(*) FROM investments WHERE user_id=u.id AND status='active') as active_plans
+       FROM user_ips ui JOIN users u ON u.id = ui.user_id
+       WHERE ui.ip = ANY($1::text[]) ORDER BY ui.ip, ui.first_seen ASC`,
+      [ipList]
+    );
+
+    const usersByIp = {};
+    userRows2.forEach(r => {
+      if (!usersByIp[r.ip]) usersByIp[r.ip] = [];
+      usersByIp[r.ip].push({
+        id: r.id, first_name: r.first_name, username: r.username, uid: r.uid,
+        registered_at: r.registered_at, is_banned: r.is_banned,
+        active_plans: parseInt(r.active_plans)||0,
+        ip_first_seen: r.ip_first_seen, ip_last_seen: r.ip_last_seen
+      });
+    });
+
+    const result = groups.map(g => ({
+      ip: g.ip,
+      account_count: parseInt(g.account_count),
+      first_seen: g.first_seen,
+      last_seen:  g.last_seen,
+      suspicious: parseInt(g.account_count) >= 3,
+      users: usersByIp[g.ip] || []
+    }));
+
+    res.json({ groups: result, total, page, limit, pages: Math.ceil(total/limit) });
+  } catch(e) { log('ERROR', 'ip-monitor: ' + e.message); res.status(500).json({error:'Server error'}); }
+});
+
 // WEBHOOK LOGS — Admin visibility
 // GET /admin/webhook-logs?limit=50&status=error
 // ══════════════════════════════════════════
