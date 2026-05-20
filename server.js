@@ -868,6 +868,7 @@ async function setupDB() {
   // Runs safely every startup — skips already-migrated users via cancel_refund_migrated flag
   try {
     await db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS cancel_refund_migrated BOOLEAN DEFAULT FALSE`);
+    await db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reg_ip TEXT DEFAULT NULL`);
 
     // Find users who have cancel refunds but not yet migrated
     const toMigrate = await db.all(`
@@ -1292,17 +1293,19 @@ app.post('/api/auth', authLimit, async (req, res) => {
     }
 
     // Upsert user
+    const _authRegIp = (req.headers['x-forwarded-for']||'').split(',')[0].trim() || req.ip || null;
     await db.run(`
-      INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by,reg_ip)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
       ON CONFLICT (id) DO UPDATE SET
         first_name=CASE WHEN EXCLUDED.first_name != '' THEN EXCLUDED.first_name ELSE users.first_name END,
         last_name=CASE WHEN EXCLUDED.last_name != '' THEN EXCLUDED.last_name ELSE users.last_name END,
         username=CASE WHEN EXCLUDED.username != '' THEN EXCLUDED.username ELSE users.username END,
         language=EXCLUDED.language,
         is_premium=EXCLUDED.is_premium,
-        referred_by=CASE WHEN users.referred_by IS NULL AND $8::BIGINT IS NOT NULL THEN $8::BIGINT ELSE users.referred_by END
-    `, [uid, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, pendingRef]);
+        referred_by=CASE WHEN users.referred_by IS NULL AND $8::BIGINT IS NOT NULL THEN $8::BIGINT ELSE users.referred_by END,
+        reg_ip=CASE WHEN users.reg_ip IS NULL THEN EXCLUDED.reg_ip ELSE users.reg_ip END
+    `, [uid, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, pendingRef, _authRegIp]);
 
     // Log referral save result
     if (pendingRef) {
@@ -1380,16 +1383,18 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
     }
 
     // ── 4. Upsert user ──────────────────────────────────
+    const _bsRegIp = (req.headers['x-forwarded-for']||'').split(',')[0].trim() || req.ip || null;
     await db.run(`
-      INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by,reg_ip)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
       ON CONFLICT (id) DO UPDATE SET
         first_name=CASE WHEN EXCLUDED.first_name != '' THEN EXCLUDED.first_name ELSE users.first_name END,
         last_name=CASE WHEN EXCLUDED.last_name != '' THEN EXCLUDED.last_name ELSE users.last_name END,
         username=CASE WHEN EXCLUDED.username != '' THEN EXCLUDED.username ELSE users.username END,
         language=EXCLUDED.language, is_premium=EXCLUDED.is_premium,
-        referred_by=CASE WHEN users.referred_by IS NULL AND $8::BIGINT IS NOT NULL THEN $8::BIGINT ELSE users.referred_by END
-    `, [uid, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, pendingRef]);
+        referred_by=CASE WHEN users.referred_by IS NULL AND $8::BIGINT IS NOT NULL THEN $8::BIGINT ELSE users.referred_by END,
+        reg_ip=CASE WHEN users.reg_ip IS NULL THEN EXCLUDED.reg_ip ELSE users.reg_ip END
+    `, [uid, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, pendingRef, _bsRegIp]);
 
     await db.run('DELETE FROM pending_refs WHERE user_id=$1', [uid]).catch(()=>{});
 
@@ -5493,127 +5498,141 @@ app.get('/admin/special/logs', adminAuth, async (req, res) => {
 // IP MONITOR — Admin endpoints
 // ══════════════════════════════════════════
 
-// GET /admin/ip-monitor/stats — summary counts
+// GET /admin/ip-monitor/stats — summary counts (tab-aware)
 app.get('/admin/ip-monitor/stats', adminAuth, async (req, res) => {
   try {
-    const [totalRow, suspRow, multiRow] = await Promise.all([
-      db.one(`SELECT COUNT(DISTINCT ip) as c FROM user_ips`),
-      db.one(`SELECT COUNT(*) as c FROM (SELECT ip FROM user_ips GROUP BY ip HAVING COUNT(DISTINCT user_id) >= 3) s`),
-      db.one(`SELECT COUNT(*) as c FROM (SELECT ip FROM user_ips GROUP BY ip HAVING COUNT(DISTINCT user_id) >= 2) s`),
-    ]);
+    const tab = req.query.tab === 'login' ? 'login' : 'reg';
+    let totalRow, suspRow, multiRow;
+    if (tab === 'reg') {
+      [totalRow, suspRow, multiRow] = await Promise.all([
+        db.one(`SELECT COUNT(DISTINCT reg_ip) as c FROM users WHERE reg_ip IS NOT NULL`),
+        db.one(`SELECT COUNT(*) as c FROM (SELECT reg_ip FROM users WHERE reg_ip IS NOT NULL GROUP BY reg_ip HAVING COUNT(*) >= 3) s`),
+        db.one(`SELECT COUNT(*) as c FROM (SELECT reg_ip FROM users WHERE reg_ip IS NOT NULL GROUP BY reg_ip HAVING COUNT(*) >= 2) s`),
+      ]);
+    } else {
+      [totalRow, suspRow, multiRow] = await Promise.all([
+        db.one(`SELECT COUNT(DISTINCT ip) as c FROM user_ips`),
+        db.one(`SELECT COUNT(*) as c FROM (SELECT ip FROM user_ips GROUP BY ip HAVING COUNT(DISTINCT user_id) >= 3) s`),
+        db.one(`SELECT COUNT(*) as c FROM (SELECT ip FROM user_ips GROUP BY ip HAVING COUNT(DISTINCT user_id) >= 2) s`),
+      ]);
+    }
     res.json({
       total_ips:  parseInt(totalRow.c) || 0,
       suspicious: parseInt(suspRow.c)  || 0,
       multi_ips:  parseInt(multiRow.c) || 0,
+      tab,
     });
   } catch(e) { log('ERROR', 'ip-monitor stats: ' + e.message); res.status(500).json({error:'Server error'}); }
 });
 
-// GET /admin/ip-monitor — grouped IP data
+// GET /admin/ip-monitor — Registration IP or Login IP grouped view
 app.get('/admin/ip-monitor', adminAuth, async (req, res) => {
   try {
     const search      = (req.query.search || '').trim();
-    const minAccounts = Math.max(1, parseInt(req.query.min_accounts) || 3);
+    const minAccounts = Math.max(1, parseInt(req.query.min_accounts) || 1);
     const page        = Math.max(1, parseInt(req.query.page) || 1);
     const limit       = Math.min(50, parseInt(req.query.limit) || 15);
     const offset      = (page - 1) * limit;
+    const tab         = req.query.tab === 'login' ? 'login' : 'reg';
 
-    let ipFilter = null; // array of IPs if search by user
-
-    if (search) {
-      // Detect if searching by IP pattern vs user
-      const isIpLike = /^[0-9.:]+/.test(search);
-      if (isIpLike) {
-        // IP search — handled via ILIKE in main query
-      } else {
-        // User search — find IPs used by matching users
-        const userRows = await db.all(
-          `SELECT DISTINCT ui.ip FROM user_ips ui
-           JOIN users u ON u.id = ui.user_id
-           WHERE CAST(u.id AS TEXT) = $1 OR u.username ILIKE $2 OR u.first_name ILIKE $2
-           LIMIT 100`,
+    if (tab === 'reg') {
+      // ── Registration IP tab ─────────────────────────────
+      let baseQ, countParams;
+      if (search && /^[0-9.:]+/.test(search)) {
+        baseQ       = `SELECT reg_ip as ip, COUNT(*) as cnt FROM users WHERE reg_ip ILIKE $1 GROUP BY reg_ip HAVING COUNT(*) >= ${minAccounts}`;
+        countParams = [`%${search}%`];
+      } else if (search) {
+        const uRows = await db.all(
+          `SELECT DISTINCT reg_ip FROM users WHERE reg_ip IS NOT NULL AND (CAST(id AS TEXT)=$1 OR username ILIKE $2 OR first_name ILIKE $2) LIMIT 50`,
           [search, `%${search}%`]
         );
-        ipFilter = userRows.map(r => r.ip);
-        if (!ipFilter.length) return res.json({ groups: [], total: 0, page, limit, pages: 0 });
+        const ips = uRows.map(r => r.reg_ip);
+        if (!ips.length) return res.json({ groups: [], total: 0, page, limit, pages: 0, tab });
+        baseQ       = `SELECT reg_ip as ip, COUNT(*) as cnt FROM users WHERE reg_ip = ANY($1::text[]) GROUP BY reg_ip`;
+        countParams = [ips];
+      } else {
+        baseQ       = `SELECT reg_ip as ip, COUNT(*) as cnt FROM users WHERE reg_ip IS NOT NULL GROUP BY reg_ip HAVING COUNT(*) >= ${minAccounts}`;
+        countParams = [];
       }
-    }
 
-    // Build where clause
-    let whereClause = `HAVING COUNT(DISTINCT user_id) >= ${minAccounts}`;
-    let countParams = [];
-    let mainParams  = [];
+      const countRow = await db.one(`SELECT COUNT(*) as c FROM (${baseQ}) sub`, countParams);
+      const total    = parseInt(countRow.c) || 0;
+      const ipRows   = await db.all(`${baseQ} ORDER BY cnt DESC LIMIT $${countParams.length+1} OFFSET $${countParams.length+2}`, [...countParams, limit, offset]);
+      const ipList   = ipRows.map(r => r.ip);
+      if (!ipList.length) return res.json({ groups: [], total, page, limit, pages: Math.ceil(total/limit), tab });
 
-    if (ipFilter) {
-      // User-based search: show all IPs of matched users regardless of min_accounts
-      whereClause = `HAVING ip = ANY($1::text[])`;
-      countParams = [ipFilter];
-      mainParams  = [ipFilter, limit, offset];
-    } else if (search) {
-      // IP pattern search
-      whereClause = `HAVING ip ILIKE $1 AND COUNT(DISTINCT user_id) >= ${minAccounts}`;
-      countParams = [`%${search}%`];
-      mainParams  = [`%${search}%`, limit, offset];
-    } else {
-      mainParams  = [limit, offset];
-    }
-
-    const baseQ = ipFilter
-      ? `SELECT ip, COUNT(DISTINCT user_id) as cnt FROM user_ips WHERE ip = ANY($1::text[]) GROUP BY ip`
-      : search
-      ? `SELECT ip, COUNT(DISTINCT user_id) as cnt FROM user_ips WHERE ip ILIKE $1 GROUP BY ip HAVING COUNT(DISTINCT user_id) >= ${minAccounts}`
-      : `SELECT ip, COUNT(DISTINCT user_id) as cnt FROM user_ips GROUP BY ip HAVING COUNT(DISTINCT user_id) >= ${minAccounts}`;
-
-    const countRow = await db.one(`SELECT COUNT(*) as c FROM (${baseQ}) sub`, countParams);
-    const total    = parseInt(countRow.c) || 0;
-
-    // Always parameterize LIMIT/OFFSET — consistent for all 3 cases
-    const ipRows = await db.all(
-      `${baseQ} ORDER BY cnt DESC LIMIT $${countParams.length+1} OFFSET $${countParams.length+2}`,
-      [...countParams, limit, offset]
-    );
-    const ipList = ipRows.map(r => r.ip);
-
-    if (!ipList.length) return res.json({ groups: [], total, page, limit, pages: Math.ceil(total/limit) });
-
-    // Fetch full IP group data
-    const groups = await db.all(
-      `SELECT ip, COUNT(DISTINCT user_id) as account_count, MIN(first_seen) as first_seen, MAX(last_seen) as last_seen
-       FROM user_ips WHERE ip = ANY($1::text[]) GROUP BY ip ORDER BY account_count DESC`,
-      [ipList]
-    );
-
-    // Fetch all users for these IPs in one query
-    const userRows2 = await db.all(
-      `SELECT ui.ip, u.id, u.first_name, u.username, u.uid, u.created_at as registered_at,
-              u.is_banned, ui.first_seen as ip_first_seen, ui.last_seen as ip_last_seen,
-              (SELECT COUNT(*) FROM investments WHERE user_id=u.id AND status='active') as active_plans
-       FROM user_ips ui JOIN users u ON u.id = ui.user_id
-       WHERE ui.ip = ANY($1::text[]) ORDER BY ui.ip, ui.first_seen ASC`,
-      [ipList]
-    );
-
-    const usersByIp = {};
-    userRows2.forEach(r => {
-      if (!usersByIp[r.ip]) usersByIp[r.ip] = [];
-      usersByIp[r.ip].push({
-        id: r.id, first_name: r.first_name, username: r.username, uid: r.uid,
-        registered_at: r.registered_at, is_banned: r.is_banned,
-        active_plans: parseInt(r.active_plans)||0,
-        ip_first_seen: r.ip_first_seen, ip_last_seen: r.ip_last_seen
+      const userRows = await db.all(
+        `SELECT u.reg_ip as ip, u.id, u.first_name, u.username, u.uid,
+                u.created_at as registered_at, u.is_banned,
+                (SELECT COUNT(*) FROM investments WHERE user_id=u.id AND status='active') as active_plans,
+                (SELECT MAX(last_seen) FROM user_ips WHERE user_id=u.id) as last_active
+         FROM users u WHERE u.reg_ip = ANY($1::text[]) ORDER BY u.reg_ip, u.created_at ASC`,
+        [ipList]
+      );
+      const usersByIp = {};
+      userRows.forEach(r => {
+        if (!usersByIp[r.ip]) usersByIp[r.ip] = [];
+        usersByIp[r.ip].push({ id:r.id, first_name:r.first_name, username:r.username, uid:r.uid,
+          registered_at:r.registered_at, is_banned:r.is_banned, active_plans:parseInt(r.active_plans)||0, last_active:r.last_active });
       });
+      const result = ipRows.map(g => ({
+        ip: g.ip, account_count: parseInt(g.cnt), suspicious: parseInt(g.cnt) >= 3,
+        first_seen: usersByIp[g.ip]?.[0]?.registered_at || null,
+        last_seen:  usersByIp[g.ip]?.[usersByIp[g.ip].length-1]?.registered_at || null,
+        users: usersByIp[g.ip] || []
+      }));
+      return res.json({ groups: result, total, page, limit, pages: Math.ceil(total/limit), tab });
+    }
+
+    // ── Login IP tab ────────────────────────────────────────
+    let lBaseQ, lParams;
+    if (search && /^[0-9.:]+/.test(search)) {
+      lBaseQ  = `SELECT ip, COUNT(DISTINCT user_id) as cnt FROM user_ips WHERE ip ILIKE $1 GROUP BY ip HAVING COUNT(DISTINCT user_id) >= ${minAccounts}`;
+      lParams = [`%${search}%`];
+    } else if (search) {
+      const luRows = await db.all(
+        `SELECT DISTINCT ui.ip FROM user_ips ui JOIN users u ON u.id=ui.user_id
+         WHERE CAST(u.id AS TEXT)=$1 OR u.username ILIKE $2 OR u.first_name ILIKE $2 LIMIT 50`,
+        [search, `%${search}%`]
+      );
+      const lips = luRows.map(r => r.ip);
+      if (!lips.length) return res.json({ groups: [], total: 0, page, limit, pages: 0, tab });
+      lBaseQ  = `SELECT ip, COUNT(DISTINCT user_id) as cnt FROM user_ips WHERE ip = ANY($1::text[]) GROUP BY ip`;
+      lParams = [lips];
+    } else {
+      lBaseQ  = `SELECT ip, COUNT(DISTINCT user_id) as cnt FROM user_ips GROUP BY ip HAVING COUNT(DISTINCT user_id) >= ${minAccounts}`;
+      lParams = [];
+    }
+
+    const lCountRow = await db.one(`SELECT COUNT(*) as c FROM (${lBaseQ}) sub`, lParams);
+    const lTotal    = parseInt(lCountRow.c) || 0;
+    const lIpRows   = await db.all(`${lBaseQ} ORDER BY cnt DESC LIMIT $${lParams.length+1} OFFSET $${lParams.length+2}`, [...lParams, limit, offset]);
+    const lIpList   = lIpRows.map(r => r.ip);
+    if (!lIpList.length) return res.json({ groups: [], total: lTotal, page, limit, pages: Math.ceil(lTotal/limit), tab });
+
+    const lUserRows = await db.all(
+      `SELECT ui.ip, u.id, u.first_name, u.username, u.uid, u.created_at as registered_at,
+              u.is_banned, ui.first_seen as ip_first_seen, ui.last_seen as last_active,
+              (SELECT COUNT(*) FROM investments WHERE user_id=u.id AND status='active') as active_plans
+       FROM user_ips ui JOIN users u ON u.id=ui.user_id
+       WHERE ui.ip = ANY($1::text[]) ORDER BY ui.ip, ui.last_seen DESC`,
+      [lIpList]
+    );
+    const lUsersByIp = {};
+    lUserRows.forEach(r => {
+      if (!lUsersByIp[r.ip]) lUsersByIp[r.ip] = [];
+      lUsersByIp[r.ip].push({ id:r.id, first_name:r.first_name, username:r.username, uid:r.uid,
+        registered_at:r.registered_at, is_banned:r.is_banned, active_plans:parseInt(r.active_plans)||0,
+        last_active:r.last_active });
     });
-
-    const result = groups.map(g => ({
-      ip: g.ip,
-      account_count: parseInt(g.account_count),
-      first_seen: g.first_seen,
-      last_seen:  g.last_seen,
-      suspicious: parseInt(g.account_count) >= 3,
-      users: usersByIp[g.ip] || []
+    const lResult = lIpRows.map(g => ({
+      ip: g.ip, account_count: parseInt(g.cnt), suspicious: parseInt(g.cnt) >= 3,
+      first_seen: lUsersByIp[g.ip]?.[lUsersByIp[g.ip].length-1]?.last_active || null,
+      last_seen:  lUsersByIp[g.ip]?.[0]?.last_active || null,
+      users: lUsersByIp[g.ip] || []
     }));
+    return res.json({ groups: lResult, total: lTotal, page, limit, pages: Math.ceil(lTotal/limit), tab });
 
-    res.json({ groups: result, total, page, limit, pages: Math.ceil(total/limit) });
   } catch(e) { log('ERROR', 'ip-monitor: ' + e.message); res.status(500).json({error:'Server error'}); }
 });
 
